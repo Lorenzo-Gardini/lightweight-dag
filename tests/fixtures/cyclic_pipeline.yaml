@@ -1,0 +1,7 @@
+nodes:
+  - node_id: first_step
+    operation: filter_orders
+    inputs: [second_step]
+  - node_id: second_step
+    operation: summarize_sales
+    inputs: [first_step]

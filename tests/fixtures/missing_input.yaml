@@ -1,0 +1,4 @@
+nodes:
+  - node_id: valid_orders
+    operation: filter_orders
+    inputs: [raw_orders]

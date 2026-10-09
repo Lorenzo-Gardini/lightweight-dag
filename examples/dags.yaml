@@ -1,0 +1,25 @@
+monthly_report:
+  nodes:
+    - node_id: orders
+      operation: load_orders
+    - node_id: eligible_orders
+      operation: filter_orders
+      inputs: [orders]
+      params:
+        minimum_total: 50
+    - node_id: summary
+      operation: summarize_orders
+      inputs: [eligible_orders]
+
+sales_audit:
+  nodes:
+    - node_id: orders
+      operation: load_orders
+    - node_id: total
+      operation: calculate_total
+      inputs: [orders]
+    - node_id: audit_result
+      operation: classify_total
+      inputs: [total]
+      params:
+        review_threshold: 100

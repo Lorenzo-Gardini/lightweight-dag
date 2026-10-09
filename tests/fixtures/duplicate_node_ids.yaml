@@ -1,0 +1,5 @@
+nodes:
+  - node_id: orders
+    operation: read_orders
+  - node_id: orders
+    operation: read_orders

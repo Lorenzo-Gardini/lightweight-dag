@@ -1,0 +1,50 @@
+nodes:
+  - node_id: A
+    operation: record
+    params:
+      label: A
+  - node_id: B
+    operation: record
+    inputs: [A]
+    params:
+      label: B
+  - node_id: E
+    operation: record
+    inputs: [B]
+    params:
+      label: E
+  - node_id: G
+    operation: record
+    inputs: [E]
+    params:
+      label: G
+  - node_id: H
+    operation: record
+    inputs: [E]
+    params:
+      label: H
+  - node_id: F
+    operation: record
+    inputs: [B]
+    params:
+      label: F
+  - node_id: I
+    operation: record
+    inputs: [F]
+    params:
+      label: I
+  - node_id: J
+    operation: record
+    inputs: [F]
+    params:
+      label: J
+  - node_id: K
+    operation: record
+    inputs: [G, H]
+    params:
+      label: K
+  - node_id: N
+    operation: record
+    inputs: [I, J, G]
+    params:
+      label: N

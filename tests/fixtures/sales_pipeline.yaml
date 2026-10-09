@@ -1,0 +1,15 @@
+nodes:
+  - node_id: daily_sales
+    operation: summarize_sales
+    inputs: [valid_orders]
+    params:
+      group_by: date
+  - node_id: valid_orders
+    operation: filter_orders
+    inputs: [orders]
+    params:
+      minimum_amount: 50
+  - node_id: orders
+    operation: read_orders
+    params:
+      source: local

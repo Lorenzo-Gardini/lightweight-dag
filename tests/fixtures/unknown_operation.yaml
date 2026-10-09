@@ -1,0 +1,3 @@
+nodes:
+  - node_id: daily_sales
+    operation: send_report
