@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from types import FunctionType
 
 import pytest
 
@@ -78,8 +79,7 @@ def test_dag_node_registers_global_and_dag_scoped_functions(monkeypatch):
     assert get_node("transform", "other") is None
     assert get_node_ids("report") == ["transform"]
 
-    with pytest.raises(ValueError, match="already registered"):
-        dag_node("report", "transform")(report_transform_operation)
+    assert dag_node("report", "transform")(report_transform_operation) is report_transform_operation
 
 
 @pytest.mark.parametrize("args", [("", "transform"), ("report", ""), ("report", None)])
@@ -93,7 +93,22 @@ def test_dag_node_rejects_duplicate_identifier(monkeypatch):
     dag_node("sample_operation")(sample_operation)
 
     with pytest.raises(ValueError, match="already registered"):
-        dag_node("sample_operation")(sample_operation)
+        dag_node("sample_operation")(global_transform_operation)
+
+
+def test_dag_node_ignores_reregistration_of_same_function(monkeypatch):
+    monkeypatch.setattr(node_registry, "_nodes", {})
+    dag_node()(sample_operation)
+    redefined_function = FunctionType(
+        sample_operation.__code__,
+        sample_operation.__globals__,
+        name=sample_operation.__name__,
+    )
+    redefined_function.__qualname__ = sample_operation.__qualname__
+    redefined_function.__module__ = sample_operation.__module__
+
+    assert dag_node()(redefined_function) is redefined_function
+    assert get_node("sample_operation") is sample_operation
 
 
 def test_concurrent_duplicate_registration_is_atomic(monkeypatch):
@@ -103,16 +118,13 @@ def test_concurrent_duplicate_registration_is_atomic(monkeypatch):
 
     def register_operation():
         start.wait()
-        try:
-            dag_node("shared_operation")(sample_operation)
-        except ValueError:
-            return False
-        return True
+        return dag_node("shared_operation")(sample_operation) is sample_operation
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         registered = list(executor.map(lambda _: register_operation(), range(workers)))
 
-    assert sum(registered) == 1
+    assert all(registered)
+    assert get_node_ids() == ["shared_operation"]
     assert get_node("shared_operation") is sample_operation
 
 

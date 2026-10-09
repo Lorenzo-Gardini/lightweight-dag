@@ -92,6 +92,20 @@ def dag_node(
         key = (scope, resolved_operation_id)
         with _nodes_lock:
             if key in _nodes:
+                existing_func = _nodes[key]
+                if (
+                    existing_func is func
+                    or (
+                        inspect.isfunction(existing_func)
+                        and existing_func.__module__ == func.__module__
+                        and existing_func.__qualname__ == func.__qualname__
+                        and existing_func.__code__.co_code == func.__code__.co_code
+                        and existing_func.__code__.co_consts == func.__code__.co_consts
+                        and existing_func.__defaults__ == func.__defaults__
+                        and existing_func.__kwdefaults__ == func.__kwdefaults__
+                    )
+                ):
+                    return func
                 raise ValueError(
                     f"Node ID '{resolved_operation_id}' is already registered"
                 )
