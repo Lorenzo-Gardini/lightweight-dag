@@ -69,10 +69,11 @@ class Node(BaseModel):
     node_id: str = Field(..., description="The unique identifier for this node")
     operation: str = Field(..., description="The operation performed by this node")
     inputs: list[str] = Field(
-        default_factory=list, description="List of input node IDs"
+        default_factory=_FrozenList, description="List of input node IDs"
     )
     params: dict[str, int | float | str] = Field(
-        default_factory=dict, description="Dictionary of parameters for this node"
+        default_factory=_FrozenDict,
+        description="Dictionary of parameters for this node",
     )
 
     model_config = ConfigDict(
@@ -98,7 +99,8 @@ class DagExecutionResult(BaseModel):
 
     status: bool
     results: dict[str, Any] = Field(
-        default_factory=dict, description="Dictionary of results for this DAG execution"
+        default_factory=_FrozenDict,
+        description="Dictionary of results for this DAG execution",
     )
 
     model_config = ConfigDict(
@@ -126,6 +128,42 @@ class NodeExecutionResult(BaseModel):
         frozen=True,
         arbitrary_types_allowed=True,
     )
+
+
+class DagExecutionPlan(BaseModel):
+    """Immutable description of the nodes and external inputs for a DAG run."""
+
+    execution_order: list[str] = Field(
+        default_factory=_FrozenList,
+        description="Node IDs in the order they would execute",
+    )
+    required_external_inputs: list[str] = Field(
+        default_factory=_FrozenList,
+        description="External input names required by the selected execution",
+    )
+    missing_external_inputs: list[str] = Field(
+        default_factory=_FrozenList,
+        description="Required external input names not supplied to explain",
+    )
+    seeded_nodes: list[str] = Field(
+        default_factory=_FrozenList,
+        description="Selected node IDs whose values were supplied directly",
+    )
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
+
+    @field_validator(
+        "execution_order",
+        "required_external_inputs",
+        "missing_external_inputs",
+        "seeded_nodes",
+    )
+    @classmethod
+    def freeze_plan_lists(cls, value: list[str]) -> list[str]:
+        return _FrozenList(value)
 
 
 class Dag(BaseModel):
@@ -259,23 +297,12 @@ class Dag(BaseModel):
 
         return result
 
-    def run(
+    def explain(
         self,
         outputs: list[str] | None = None,
-        listeners: list[Callable[[NodeExecutionResult], None]] | None = None,
         **inputs: Any,
-    ) -> DagExecutionResult:
-        """Execute requested outputs and their transitive dependencies.
-
-        Each operation receives predecessor results and node params as keyword
-        arguments. Failed nodes are skipped along with their descendants, while
-        independent requested branches continue to run. Values passed as
-        keyword arguments seed matching nodes and skip their operations. If
-        listeners are provided, each receives a NodeExecutionResult after a
-        required node succeeds, fails, is skipped, or uses a supplied value.
-        Listener exceptions propagate to the caller. If outputs is omitted,
-        every node is selected; an empty list selects no nodes.
-        """
+    ) -> DagExecutionPlan:
+        """Describe a selected execution without running any operations."""
         nodes_by_id = self._nodes_by_id
         node_ids = nodes_by_id.keys()
         external_input_ids = {
@@ -285,7 +312,7 @@ class Dag(BaseModel):
             if input_id not in node_ids
         }
         selected_outputs = list(nodes_by_id) if outputs is None else outputs
-        unknown_outputs = set(selected_outputs) - nodes_by_id.keys()
+        unknown_outputs = set(selected_outputs) - node_ids
         if unknown_outputs:
             raise ValueError(
                 f"Outputs reference non-existent nodes: {sorted(unknown_outputs)}"
@@ -312,12 +339,7 @@ class Dag(BaseModel):
                             pending_node_ids.append(input_id)
                         else:
                             required_external_input_ids.add(input_id)
-        missing_external_inputs = required_external_input_ids - inputs.keys()
-        if missing_external_inputs:
-            raise ValueError(
-                "Missing values for external inputs: "
-                f"{sorted(missing_external_inputs)}"
-            )
+
         nodes_for_sort = [
             node.model_copy(
                 update={
@@ -330,7 +352,43 @@ class Dag(BaseModel):
             )
             for node in required_nodes
         ]
-        sorted_node_ids = self.topological_sort(nodes_for_sort)
+        execution_order = self.topological_sort(nodes_for_sort)
+        required_external_inputs = sorted(required_external_input_ids)
+        missing_external_inputs = [
+            input_id for input_id in required_external_inputs if input_id not in inputs
+        ]
+        seeded_nodes = [node_id for node_id in execution_order if node_id in inputs]
+        return DagExecutionPlan(
+            execution_order=execution_order,
+            required_external_inputs=required_external_inputs,
+            missing_external_inputs=missing_external_inputs,
+            seeded_nodes=seeded_nodes,
+        )
+
+    def run(
+        self,
+        outputs: list[str] | None = None,
+        listeners: list[Callable[[NodeExecutionResult], None]] | None = None,
+        **inputs: Any,
+    ) -> DagExecutionResult:
+        """Execute requested outputs and their transitive dependencies.
+
+        Each operation receives predecessor results and node params as keyword
+        arguments. Failed nodes are skipped along with their descendants, while
+        independent requested branches continue to run. Values passed as
+        keyword arguments seed matching nodes and skip their operations. If
+        listeners are provided, each receives a NodeExecutionResult after a
+        required node succeeds, fails, is skipped, or uses a supplied value.
+        Listener exceptions propagate to the caller. If outputs is omitted,
+        every node is selected; an empty list selects no nodes.
+        """
+        plan = self.explain(outputs=outputs, **inputs)
+        if plan.missing_external_inputs:
+            raise ValueError(
+                "Missing values for external inputs: " f"{plan.missing_external_inputs}"
+            )
+        nodes_by_id = self._nodes_by_id
+        sorted_node_ids = plan.execution_order
         context = {}
         is_run_successful = True
         failed_node_ids = set()

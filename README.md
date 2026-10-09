@@ -231,6 +231,21 @@ ancestors are skipped; downstream nodes receive the supplied value as usual.
 External inputs are checked when `run` executes a path that requires them;
 missing values or undeclared input names raise `ValueError`.
 
+Use `explain()` to inspect a planned execution without running operations. Its
+Pydantic result exposes immutable lists for the execution order, required and
+missing external inputs, and precomputed (`seeded`) nodes:
+
+```python
+plan = dag.explain(outputs=["combined"])
+assert plan.execution_order == ["elem1", "combined"]
+assert plan.required_external_inputs == ["elem2"]
+assert plan.missing_external_inputs == ["elem2"]
+assert plan.seeded_nodes == []
+```
+
+Pass values to `explain()` just as you would to `run()` to see which external
+inputs remain missing and which nodes will be seeded.
+
 To observe nodes as they finish, pass callbacks with `listeners`. Each callback
 receives a `NodeExecutionResult` containing the `node_id`, a boolean
 `result` indicating success, and the node's `value` (`None` on failure). The

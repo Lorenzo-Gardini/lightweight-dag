@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from yaml.constructor import ConstructorError
 
 import lightweight_dag.dag as dag_module
-from lightweight_dag import DagSuite, dag_node, node_registry
+from lightweight_dag import DagExecutionPlan, DagSuite, dag_node, node_registry
 from lightweight_dag.dag import Dag, DagExecutionResult, Node, NodeExecutionResult
 
 FIXTURES_DIRECTORY = Path(__file__).parent / "fixtures"
@@ -151,17 +151,36 @@ def test_dag_model_collections_cannot_be_mutated():
         params={"path": "orders.csv"},
     )
     dag = Dag(nodes=[node])
+    default_result = DagExecutionResult(status=True)
     execution_result = DagExecutionResult(status=True, results={"answer": 42})
+    default_plan = DagExecutionPlan()
+    plan = DagExecutionPlan(
+        execution_order=["answer"],
+        required_external_inputs=[],
+        missing_external_inputs=[],
+        seeded_nodes=[],
+    )
     suite = DagSuite.from_dict({})
 
+    default_node = Node(node_id="empty", operation="read_orders")
     with pytest.raises(TypeError, match="immutable"):
         node.inputs.append("other")
     with pytest.raises(TypeError, match="immutable"):
+        default_node.inputs.append("other")
+    with pytest.raises(TypeError, match="immutable"):
         node.params.update({"path": "other.csv"})
+    with pytest.raises(TypeError, match="immutable"):
+        default_node.params.update({"path": "orders.csv"})
     with pytest.raises(TypeError, match="immutable"):
         dag.nodes.append(node)
     with pytest.raises(TypeError, match="immutable"):
         execution_result.results.update({"answer": 0})
+    with pytest.raises(TypeError, match="immutable"):
+        default_result.results.update({"answer": 42})
+    with pytest.raises(TypeError, match="immutable"):
+        plan.execution_order.append("other")
+    with pytest.raises(TypeError, match="immutable"):
+        default_plan.execution_order.append("answer")
     with pytest.raises(TypeError, match="immutable"):
         suite.dags["other"] = dag
 
@@ -467,6 +486,7 @@ def test_topological_sort_rejects_invalid_node_relationships(nodes, error_messag
         Dag.topological_sort(nodes)
 
 
+@pytest.mark.usefixtures("registered_operations")
 def test_dag_rejects_self_dependency():
     with pytest.raises(ValidationError, match="DAG contains a cycle"):
         Dag.from_dict(
@@ -754,6 +774,71 @@ def test_run_passes_external_inputs_alongside_node_inputs(monkeypatch):
         ("elem1", True, 2),
         ("combined", True, 7),
     ]
+
+
+def test_explain_reports_execution_order_and_external_inputs(monkeypatch):
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {
+            "load_elem1": lambda: 2,
+            "combine": lambda elem1, elem2: elem1 + elem2,
+        },
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "elem1", "operation": "load_elem1"},
+                {
+                    "node_id": "combined",
+                    "operation": "combine",
+                    "inputs": ["elem1", "elem2"],
+                },
+            ]
+        }
+    )
+
+    plan = dag.explain(outputs=["combined"])
+
+    assert isinstance(plan, DagExecutionPlan)
+    assert plan.execution_order == ["elem1", "combined"]
+    assert plan.required_external_inputs == ["elem2"]
+    assert plan.missing_external_inputs == ["elem2"]
+    assert plan.seeded_nodes == []
+
+
+def test_explain_accounts_for_external_values_and_seeded_nodes(monkeypatch):
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {
+            "load_source": lambda: 1,
+            "load_elem1": lambda source: source + 1,
+            "combine": lambda elem1, elem2: elem1 + elem2,
+        },
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "source", "operation": "load_source"},
+                {
+                    "node_id": "elem1",
+                    "operation": "load_elem1",
+                    "inputs": ["source"],
+                },
+                {
+                    "node_id": "combined",
+                    "operation": "combine",
+                    "inputs": ["elem1", "elem2"],
+                },
+            ]
+        }
+    )
+
+    plan = dag.explain(outputs=["combined"], elem1=3, elem2=5)
+
+    assert plan.execution_order == ["elem1", "combined"]
+    assert plan.required_external_inputs == ["elem2"]
+    assert plan.missing_external_inputs == []
+    assert plan.seeded_nodes == ["elem1"]
 
 
 def test_run_does_not_require_external_inputs_on_unselected_paths(monkeypatch):
