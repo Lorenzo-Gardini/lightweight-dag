@@ -9,13 +9,14 @@ Requires Python 3.11 or later.
 
 ## Installation
 
-Install the library from the repository:
+Install the published package from PyPI with uv:
 
 ```bash
-pip install .
+uv add lightweight-dag
 ```
 
-To install the development and test dependencies:
+To install the development and test dependencies when working from a clone of
+the repository:
 
 ```bash
 uv sync --group dev
