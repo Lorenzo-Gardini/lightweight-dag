@@ -3,6 +3,7 @@
 from collections import deque
 from collections.abc import Callable
 from functools import cached_property
+from inspect import signature
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -338,6 +339,19 @@ class Dag(BaseModel):
             if self.name is None
             else get_registered_nodes(self.name)
         )
+        for node_id in sorted_node_ids:
+            if node_id in inputs:
+                continue
+            node = nodes_by_id[node_id]
+            argument_names = dict.fromkeys(node.params)
+            argument_names.update(dict.fromkeys(node.inputs))
+            try:
+                signature(registered_functions[node.operation]).bind(**argument_names)
+            except TypeError as error:
+                raise ValueError(
+                    f"Invalid arguments for node '{node_id}' "
+                    f"(operation '{node.operation}'): {error}"
+                ) from error
 
         def notify_listeners(node_id: str, result: bool, value: Any) -> None:
             if listeners is None:
@@ -377,8 +391,8 @@ class Dag(BaseModel):
             )
             try:
                 result = registered_functions[node.operation](**node_inputs)
-            except Exception:
-                context[node_id] = None
+            except Exception as error:
+                context[node_id] = error
                 failed_node_ids.add(node_id)
                 is_run_successful = False
                 notify_listeners(node_id, False, None)

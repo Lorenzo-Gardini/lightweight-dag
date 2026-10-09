@@ -382,6 +382,56 @@ def test_node_input_overrides_param_with_the_same_name(monkeypatch):
     assert received_orders == [["computed"]]
 
 
+def test_run_validates_operation_arguments_before_executing_nodes(monkeypatch):
+    executed = []
+
+    def load_value():
+        executed.append("load")
+        return 1
+
+    def consume_value(value):
+        return value
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"load_value": load_value, "consume_value": consume_value},
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "value", "operation": "load_value"},
+                {
+                    "node_id": "result",
+                    "operation": "consume_value",
+                    "inputs": ["value"],
+                    "params": {"unexpected": True},
+                },
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="Invalid arguments for node 'result'"):
+        dag.run(outputs=["result"])
+
+    assert executed == []
+
+
+def test_run_validates_required_operation_arguments(monkeypatch):
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"consume_value": lambda value: value},
+    )
+    dag = Dag.from_dict(
+        {"nodes": [{"node_id": "result", "operation": "consume_value"}]}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid arguments for node 'result'.*required argument: 'value'",
+    ):
+        dag.run()
+
+
 def test_topological_sort_handles_nodes_declared_out_of_order():
     nodes = [
         Node(node_id="report", operation="summarize_sales", inputs=["filtered"]),
@@ -862,7 +912,8 @@ def test_run_keeps_independent_branch_results_when_another_branch_fails(
     )
 
     assert result.status is False
-    assert result.results["failed_node"] is None
+    assert isinstance(result.results["failed_node"], RuntimeError)
+    assert str(result.results["failed_node"]) == "operation failed"
     assert result.results["failed_output"] is None
     assert result.results["independent_output"] == "available"
     assert executed == ["independent"]
@@ -884,4 +935,5 @@ def test_run_reports_failure_when_an_operation_raises(registered_operations):
     result = dag.run(outputs=["daily_sales"])
 
     assert result.status is False
-    assert result.results["valid_orders"] is None
+    assert isinstance(result.results["valid_orders"], RuntimeError)
+    assert str(result.results["valid_orders"]) == "Could not read order records"

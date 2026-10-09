@@ -206,7 +206,9 @@ selected outputs and their dependencies, pass their IDs in `outputs`. Each
 operation receives its predecessor node results and the YAML `params` as
 keyword arguments. Argument names correspond to predecessor IDs or parameter
 keys. Inputs that don't match a node ID are external inputs and are supplied
-as keyword arguments to `run`, for example `dag.run(elem2=value)`.
+as keyword arguments to `run`, for example `dag.run(elem2=value)`. Before
+execution, `run` checks each selected operation's signature for missing
+required arguments and unexpected argument names.
 
 ```python
 all_results = monthly_report.run()
@@ -309,10 +311,10 @@ assert result.results == {
 assert "c" not in result.results
 ```
 
-If an operation raises an exception, its result and the results of its
-dependent nodes become `None`, and `status` becomes `False`. Requested,
-independent branches continue to execute. This example demonstrates the
-failure result:
+If an operation raises an exception, its result is the exception object and
+the results of its dependent nodes become `None`; `status` becomes `False`.
+Requested, independent branches continue to execute. This example demonstrates
+the failure result:
 
 ```python
 from lightweight_dag import Dag, dag_node
@@ -340,17 +342,18 @@ failure_dag = Dag.from_dict(
 )
 failure_result = failure_dag.run(outputs=["dependent"])
 assert failure_result.status is False
-assert failure_result.results["failed"] is None
+assert isinstance(failure_result.results["failed"], RuntimeError)
 assert failure_result.results["dependent"] is None
 ```
 
 ## Validation and security
 
-Loading validates that node IDs are unique, every dependency refers to an
-existing node, the graph is acyclic, and operations are registered in the
-correct scope. It also rejects unknown fields and duplicate YAML keys. When a
-node input and a parameter have the same name, the computed input takes
-precedence. `params` values must be strings or numbers. `Node`, `Dag`, and
+Loading validates that node IDs are unique, internal dependencies refer to
+existing nodes, the graph is acyclic, and operations are registered in the
+correct scope. Required external inputs are checked at execution. It also
+rejects unknown fields and duplicate YAML keys. When a node input and a
+parameter have the same name, the computed input takes precedence. `params`
+values must be strings or numbers. `Node`, `Dag`, and
 `DagSuite` definitions, including their collections, are immutable after
 validation; `DagExecutionResult` contains the results of an individual
 execution.
