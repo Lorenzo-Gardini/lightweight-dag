@@ -40,6 +40,31 @@ def test_dag_node_registers_function_and_returns_registry_copy(monkeypatch):
     assert get_node_ids() == ["sample_operation"]
 
 
+def test_dag_node_infers_operation_id_from_function_name(monkeypatch):
+    monkeypatch.setattr(node_registry, "_nodes", {})
+
+    dag_node()(sample_operation)
+
+    assert get_node("sample_operation") is sample_operation
+
+
+def test_dag_node_infers_operation_id_for_named_dag(monkeypatch):
+    monkeypatch.setattr(node_registry, "_nodes", {})
+
+    dag_node(dag_name="report")(report_transform_operation)
+
+    assert get_node("report_transform_operation", "report") is report_transform_operation
+
+
+def test_dag_node_can_be_used_without_parentheses(monkeypatch):
+    monkeypatch.setattr(node_registry, "_nodes", {})
+
+    registered_function = dag_node(sample_operation)
+
+    assert registered_function is sample_operation
+    assert get_node("sample_operation") is sample_operation
+
+
 def test_dag_node_registers_global_and_dag_scoped_functions(monkeypatch):
     monkeypatch.setattr(node_registry, "_nodes", {})
 

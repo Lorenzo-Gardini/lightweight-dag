@@ -13,6 +13,18 @@ _MISSING = object()
 
 
 @overload
+def dag_node() -> Callable[[F], F]: ...
+
+
+@overload
+def dag_node(func: F, /) -> F: ...
+
+
+@overload
+def dag_node(*, dag_name: str) -> Callable[[F], F]: ...
+
+
+@overload
 def dag_node(node_id: str) -> Callable[[F], F]: ...
 
 
@@ -21,25 +33,50 @@ def dag_node(dag_name: str, node_id: str) -> Callable[[F], F]: ...
 
 
 def dag_node(
-    dag_name_or_node_id: str,
+    dag_name_or_node_id: str | F | None | object = _MISSING,
     node_id: str | None | object = _MISSING,
-) -> Callable[[F], F]:
+    *,
+    dag_name: str | None = None,
+) -> Callable[[F], F] | F:
     """Register a global operation or one scoped to a named DAG.
 
-    Use ``@dag_node("operation")`` for a global operation or
-    ``@dag_node("dag_name", "operation")`` for a DAG-specific version.
+    The operation ID defaults to the function name. Use ``@dag_node("operation")``
+    or ``@dag_node("dag_name", "operation")`` to provide it explicitly, or
+    ``@dag_node(dag_name="dag_name")`` to infer it in a DAG-specific scope.
     Named DAG scopes do not fall back to global registrations.
     """
-    if node_id is _MISSING:
-        dag_name = None
+    direct_func = None
+    if inspect.isfunction(dag_name_or_node_id):
+        if node_id is not _MISSING or dag_name is not None:
+            raise TypeError("A function cannot be combined with decorator arguments")
+        direct_func = dag_name_or_node_id
+        scope = None
+        operation_id = _MISSING
+    elif dag_name is not None:
+        if dag_name_or_node_id is not _MISSING:
+            raise TypeError("Use either positional arguments or dag_name, not both")
+        scope = dag_name
+        operation_id = node_id
+    elif dag_name_or_node_id is _MISSING:
+        scope = None
+        operation_id = node_id
+    elif dag_name_or_node_id is None:
+        if node_id is _MISSING:
+            raise ValueError("node_id must be a non-empty string")
+        scope = None
+        operation_id = node_id
+    elif node_id is _MISSING:
+        scope = None
         operation_id = dag_name_or_node_id
     else:
-        dag_name = dag_name_or_node_id
+        scope = dag_name_or_node_id
         operation_id = node_id
 
-    if not isinstance(operation_id, str) or not operation_id:
+    if operation_id is not _MISSING and (
+        not isinstance(operation_id, str) or not operation_id
+    ):
         raise ValueError("node_id must be a non-empty string")
-    if dag_name is not None and (not isinstance(dag_name, str) or not dag_name):
+    if scope is not None and (not isinstance(scope, str) or not scope):
         raise ValueError("dag_name must be a non-empty string")
 
     def register(func: F) -> F:
@@ -49,13 +86,20 @@ def dag_node(
             raise TypeError("@dag_node can only decorate functions")
         if func.__qualname__ != func.__name__:
             raise TypeError("@dag_node can only decorate module-level functions")
-        key = (dag_name, operation_id)
+        resolved_operation_id = (
+            func.__name__ if operation_id is _MISSING else operation_id
+        )
+        key = (scope, resolved_operation_id)
         with _nodes_lock:
             if key in _nodes:
-                raise ValueError(f"Node ID '{operation_id}' is already registered")
+                raise ValueError(
+                    f"Node ID '{resolved_operation_id}' is already registered"
+                )
             _nodes[key] = func
         return func
 
+    if direct_func is not None:
+        return register(direct_func)
     return register
 
 
