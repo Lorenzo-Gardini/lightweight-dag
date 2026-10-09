@@ -6,9 +6,24 @@ from yaml.constructor import ConstructorError
 
 import lightweight_dag.dag as dag_module
 from lightweight_dag import DagSuite, dag_node, node_registry
-from lightweight_dag.dag import Dag, Node
+from lightweight_dag.dag import Dag, DagExecutionResult, Node, NodeExecutionResult
 
 FIXTURES_DIRECTORY = Path(__file__).parent / "fixtures"
+
+
+def test_node_execution_result_accepts_custom_value_types():
+    class CustomValue:
+        pass
+
+    value = CustomValue()
+
+    event = NodeExecutionResult(
+        node_id="custom_output",
+        result=True,
+        value=value,
+    )
+
+    assert event.value is value
 
 
 def registered_scale_operation(value, multiplier):
@@ -19,7 +34,8 @@ def registered_load_value():
     return 14
 
 
-def test_from_yaml_loads_sales_pipeline(registered_operations):
+@pytest.mark.usefixtures("registered_operations")
+def test_from_yaml_loads_sales_pipeline():
     yaml_config = (FIXTURES_DIRECTORY / "sales_pipeline.yaml").read_text()
 
     dag = Dag.from_yaml(yaml_config)
@@ -42,7 +58,6 @@ def test_from_yaml_loads_sales_pipeline(registered_operations):
     ("fixture_name", "error_message"),
     [
         ("duplicate_node_ids.yaml", "Node IDs must be unique"),
-        ("missing_input.yaml", "Inputs reference non-existent nodes"),
         ("cyclic_pipeline.yaml", "DAG contains a cycle"),
         (
             "unknown_operation.yaml",
@@ -50,16 +65,26 @@ def test_from_yaml_loads_sales_pipeline(registered_operations):
         ),
     ],
 )
-def test_from_yaml_rejects_invalid_pipelines(
-    registered_operations, fixture_name, error_message
-):
+@pytest.mark.usefixtures("registered_operations")
+def test_from_yaml_rejects_invalid_pipelines(fixture_name, error_message):
     yaml_config = (FIXTURES_DIRECTORY / fixture_name).read_text()
 
     with pytest.raises(ValidationError, match=error_message):
         Dag.from_yaml(yaml_config)
 
 
-def test_from_dict_loads_a_dag(registered_operations):
+@pytest.mark.usefixtures("registered_operations")
+def test_from_yaml_defers_external_input_validation_until_run():
+    yaml_config = (FIXTURES_DIRECTORY / "missing_input.yaml").read_text()
+
+    dag = Dag.from_yaml(yaml_config)
+
+    with pytest.raises(ValueError, match="Missing values for external inputs"):
+        dag.run()
+
+
+@pytest.mark.usefixtures("registered_operations")
+def test_from_dict_loads_a_dag():
     dag = Dag.from_dict(
         {
             "nodes": [
@@ -117,7 +142,8 @@ def test_yaml_loaders_reject_duplicate_mapping_keys(loader, yaml_config):
         loader(yaml_config)
 
 
-def test_dag_model_collections_cannot_be_mutated(registered_operations):
+@pytest.mark.usefixtures("registered_operations")
+def test_dag_model_collections_cannot_be_mutated():
     node = Node(
         node_id="orders",
         operation="read_orders",
@@ -125,6 +151,7 @@ def test_dag_model_collections_cannot_be_mutated(registered_operations):
         params={"path": "orders.csv"},
     )
     dag = Dag(nodes=[node])
+    execution_result = DagExecutionResult(status=True, results={"answer": 42})
     suite = DagSuite.from_dict({})
 
     with pytest.raises(TypeError, match="immutable"):
@@ -133,6 +160,8 @@ def test_dag_model_collections_cannot_be_mutated(registered_operations):
         node.params.update({"path": "other.csv"})
     with pytest.raises(TypeError, match="immutable"):
         dag.nodes.append(node)
+    with pytest.raises(TypeError, match="immutable"):
+        execution_result.results.update({"answer": 0})
     with pytest.raises(TypeError, match="immutable"):
         suite.dags["other"] = dag
 
@@ -157,9 +186,11 @@ def test_named_dag_uses_its_scoped_operation(monkeypatch):
         {"name": "report", "nodes": [{"node_id": "result", "operation": "transform"}]}
     )
 
-    result = dag.run(outputs=["result"])
+    events = []
+    result = dag.run(outputs=["result"], listeners=[events.append])
 
     assert result.results["result"] == "report"
+    assert events[0].dag_name == "report"
 
 
 def test_unnamed_dag_uses_global_operation(monkeypatch):
@@ -316,21 +347,39 @@ def test_node_rejects_unexpected_fields():
         Node(node_id="orders", operation="read_orders", unexpected=True)
 
 
-def test_dag_rejects_param_name_matching_an_input(registered_operations):
-    with pytest.raises(ValidationError, match="conflict with parameters"):
-        Dag.from_dict(
-            {
-                "nodes": [
-                    {"node_id": "orders", "operation": "read_orders"},
-                    {
-                        "node_id": "filtered_orders",
-                        "operation": "filter_orders",
-                        "inputs": ["orders"],
-                        "params": {"orders": "override"},
-                    },
-                ]
-            }
-        )
+def test_node_input_overrides_param_with_the_same_name(monkeypatch):
+    received_orders = []
+
+    def load_orders():
+        return ["computed"]
+
+    def filter_orders(orders):
+        received_orders.append(orders)
+        return orders
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"load_orders": load_orders, "filter_orders": filter_orders},
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "orders", "operation": "load_orders"},
+                {
+                    "node_id": "filtered_orders",
+                    "operation": "filter_orders",
+                    "inputs": ["orders"],
+                    "params": {"orders": "configured"},
+                },
+            ]
+        }
+    )
+
+    result = dag.run(outputs=["filtered_orders"])
+
+    assert result.status is True
+    assert result.results["filtered_orders"] == ["computed"]
+    assert received_orders == [["computed"]]
 
 
 def test_topological_sort_handles_nodes_declared_out_of_order():
@@ -368,7 +417,7 @@ def test_topological_sort_rejects_invalid_node_relationships(nodes, error_messag
         Dag.topological_sort(nodes)
 
 
-def test_dag_rejects_self_dependency(registered_operations):
+def test_dag_rejects_self_dependency():
     with pytest.raises(ValidationError, match="DAG contains a cycle"):
         Dag.from_dict(
             {
@@ -383,7 +432,8 @@ def test_dag_rejects_self_dependency(registered_operations):
         )
 
 
-def test_run_executes_sales_pipeline(registered_operations):
+@pytest.mark.usefixtures("registered_operations")
+def test_run_executes_sales_pipeline():
     yaml_config = (FIXTURES_DIRECTORY / "sales_pipeline.yaml").read_text()
     dag = Dag.from_yaml(yaml_config)
 
@@ -397,7 +447,8 @@ def test_run_executes_sales_pipeline(registered_operations):
     }
 
 
-def test_run_without_outputs_executes_all_nodes(registered_operations):
+@pytest.mark.usefixtures("registered_operations")
+def test_run_without_outputs_executes_all_nodes():
     yaml_config = (FIXTURES_DIRECTORY / "sales_pipeline.yaml").read_text()
     dag = Dag.from_yaml(yaml_config)
 
@@ -517,7 +568,7 @@ def test_run_deduplicates_requested_outputs(monkeypatch):
     assert executed == ["called"]
 
 
-def test_run_rejects_unknown_outputs(registered_operations):
+def test_run_rejects_unknown_outputs():
     dag = Dag.from_dict({"nodes": []})
 
     with pytest.raises(ValueError, match="Outputs reference non-existent nodes"):
@@ -574,6 +625,199 @@ def test_run_passes_node_params_to_registered_operation(monkeypatch):
     assert result.results["scaled_value"] == 42
 
 
+def test_run_uses_provided_node_values_instead_of_executing_them(monkeypatch):
+    executed = []
+
+    def load_value():
+        executed.append("load")
+        return 1
+
+    def scale_value(value, multiplier):
+        executed.append("scale")
+        return value * multiplier
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"load_value": load_value, "scale_value": scale_value},
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "value", "operation": "load_value"},
+                {
+                    "node_id": "scaled",
+                    "operation": "scale_value",
+                    "inputs": ["value"],
+                    "params": {"multiplier": 3},
+                },
+            ]
+        }
+    )
+
+    events = []
+    result = dag.run(value=14, outputs=["scaled"], listeners=[events.append])
+
+    assert result.status is True
+    assert result.results == {"value": 14, "scaled": 42}
+    assert executed == ["scale"]
+    assert [(event.node_id, event.result, event.value) for event in events] == [
+        ("value", True, 14),
+        ("scaled", True, 42),
+    ]
+
+
+def test_run_passes_external_inputs_alongside_node_inputs(monkeypatch):
+    executed_nodes = []
+
+    def load_elem1():
+        executed_nodes.append("elem1")
+        return 2
+
+    def combine(elem1, elem2):
+        executed_nodes.append("combined")
+        return elem1 + elem2
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"load_elem1": load_elem1, "combine": combine},
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "elem1", "operation": "load_elem1"},
+                {
+                    "node_id": "combined",
+                    "operation": "combine",
+                    "inputs": ["elem1", "elem2"],
+                },
+            ]
+        }
+    )
+    events = []
+
+    result = dag.run(elem2=5, outputs=["combined"], listeners=[events.append])
+
+    assert result.status is True
+    assert result.results == {"elem1": 2, "combined": 7}
+    assert executed_nodes == ["elem1", "combined"]
+    assert [(event.node_id, event.result, event.value) for event in events] == [
+        ("elem1", True, 2),
+        ("combined", True, 7),
+    ]
+
+
+def test_run_does_not_require_external_inputs_on_unselected_paths(monkeypatch):
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {
+            "combine": lambda raw: raw,
+            "independent": lambda: "ready",
+        },
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {
+                    "node_id": "external_branch",
+                    "operation": "combine",
+                    "inputs": ["raw"],
+                },
+                {"node_id": "independent", "operation": "independent"},
+            ]
+        }
+    )
+
+    result = dag.run(outputs=["independent"])
+
+    assert result.status is True
+    assert result.results == {"independent": "ready"}
+
+
+def test_run_seeded_node_skips_its_ancestors_and_notifies_listeners(monkeypatch):
+    executed_nodes = []
+
+    def upstream():
+        executed_nodes.append("upstream")
+        return 7
+
+    def create_seeded_value(upstream_value):
+        executed_nodes.append("seeded")
+        return upstream_value * 2
+
+    def scale_value(seeded, multiplier):
+        executed_nodes.append("scaled")
+        return seeded * multiplier
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {
+            "upstream": upstream,
+            "create_seeded_value": create_seeded_value,
+            "scale_value": scale_value,
+        },
+    )
+    dag = Dag.from_dict(
+        {
+            "nodes": [
+                {"node_id": "upstream", "operation": "upstream"},
+                {
+                    "node_id": "seeded",
+                    "operation": "create_seeded_value",
+                    "inputs": ["upstream"],
+                },
+                {
+                    "node_id": "scaled",
+                    "operation": "scale_value",
+                    "inputs": ["seeded"],
+                    "params": {"multiplier": 3},
+                },
+            ]
+        }
+    )
+    events = []
+
+    result = dag.run(seeded=14, outputs=["scaled"], listeners=[events.append])
+
+    assert result.status is True
+    assert result.results == {"seeded": 14, "scaled": 42}
+    assert executed_nodes == ["scaled"]
+    assert [(event.node_id, event.result, event.value) for event in events] == [
+        ("seeded", True, 14),
+        ("scaled", True, 42),
+    ]
+
+
+def test_run_propagates_listener_exceptions_after_node_completion(monkeypatch):
+    def operation():
+        return "completed"
+
+    monkeypatch.setattr(
+        "lightweight_dag.dag.get_registered_nodes",
+        lambda: {"operation": operation},
+    )
+    dag = Dag.from_dict({"nodes": [{"node_id": "output", "operation": "operation"}]})
+    events = []
+
+    def failing_listener(event):
+        events.append(event)
+        raise RuntimeError("listener failed")
+
+    with pytest.raises(RuntimeError, match="listener failed"):
+        dag.run(listeners=[failing_listener])
+
+    assert len(events) == 1
+    assert events[0].node_id == "output"
+    assert events[0].result is True
+    assert events[0].value == "completed"
+
+
+def test_run_rejects_inputs_that_are_not_node_ids():
+    dag = Dag.from_dict({"nodes": []})
+
+    with pytest.raises(ValueError, match="Inputs are not declared by this DAG"):
+        dag.run(source=14)
+
+
 def test_run_keeps_independent_branch_results_when_another_branch_fails(
     monkeypatch,
 ):
@@ -612,13 +856,21 @@ def test_run_keeps_independent_branch_results_when_another_branch_fails(
         }
     )
 
-    result = dag.run(outputs=["failed_output", "independent_output"])
+    events = []
+    result = dag.run(
+        outputs=["failed_output", "independent_output"], listeners=[events.append]
+    )
 
     assert result.status is False
     assert result.results["failed_node"] is None
     assert result.results["failed_output"] is None
     assert result.results["independent_output"] == "available"
     assert executed == ["independent"]
+    assert {event.node_id: (event.result, event.value) for event in events} == {
+        "failed_node": (False, None),
+        "failed_output": (False, None),
+        "independent_output": (True, "available"),
+    }
 
 
 def test_run_reports_failure_when_an_operation_raises(registered_operations):
