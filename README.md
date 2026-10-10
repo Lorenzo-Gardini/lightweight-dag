@@ -38,7 +38,7 @@ flowchart LR
 ## 🧭 Jump in
 
 | | |
-|:--|:--|
+| :-- | :-- |
 | [Quick start](#-quick-start) | Define a YAML graph and execute it |
 | [Results](#-read-the-results) | Success, failure, and skipped outcomes |
 | [Execution controls](#-shape-the-run) | Select outputs, seed values, inspect the plan |
@@ -99,7 +99,7 @@ Every selected node gets one result object. Its concrete type tells you what
 happened; the run itself exposes a boolean `status`.
 
 | Outcome | Object | Read this |
-|:--|:--|:--|
+| :-- | :-- | :-- |
 | ✅ Done | `SuccessfulNodeExecutionResult` | `.value` |
 | ❌ Failed | `ErrorNodeExecutionResult` | `.error` |
 | ⏭️ Not run | `SkippedNodeExecutionResult` | No value or exception |
@@ -327,7 +327,7 @@ This is not runtime type enforcement.
 Configuration is validated before execution:
 
 | Problem | What happens |
-|:--|:--|
+| :-- | :-- |
 | Duplicate node IDs or cycles | DAG construction fails |
 | Unknown operation in this scope | DAG construction fails |
 | Missing external input | `ValueError` |
