@@ -1,392 +1,356 @@
-# lightweight-dag
+<div align="center">
 
-Python library for defining, validating, and executing directed acyclic graphs
-(DAGs). Operations are registered Python functions. DAGs can be loaded from
-YAML or dictionaries, grouped into named suites, and executed for only the
-requested outputs.
+<h1>lightweight-dag</h1>
 
-Requires Python 3.11 or later.
+<p><strong>Small graphs. Zero orchestration overhead.</strong></p>
 
-## Installation
+<p>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Pydantic v2" src="https://img.shields.io/badge/Pydantic-v2-E92063?logo=pydantic&logoColor=white">
+  <img alt="YAML and JSON" src="https://img.shields.io/badge/config-YAML%20%2B%20JSON-CB171E?logo=yaml&logoColor=white">
+</p>
 
-Install the published package from PyPI with uv:
+<p>Define a dependency graph, run ordinary Python functions, keep the results.</p>
+
+</div>
+
+No scheduler to deploy. No database to babysit. Just an in-process DAG runner
+for Python workflows that need dependencies, not a whole platform.
+
+## ✨ The shape of it
+
+```mermaid
+flowchart LR
+    A["load_numbers()"] --> B["numbers"]
+    B --> C["total(numbers)"]
+    C --> D["answer = 12"]
+
+    classDef operation fill:#DBEAFE,stroke:#2563EB,color:#172554,stroke-width:2px
+    classDef data fill:#DCFCE7,stroke:#16A34A,color:#14532D,stroke-width:2px
+    classDef output fill:#FFEDD5,stroke:#EA580C,color:#7C2D12,stroke-width:2px
+    class A,C operation
+    class B data
+    class D output
+```
+
+<p align="center"><b>Write functions → describe dependencies → run only what you need</b></p>
+
+## 🧭 Jump in
+
+| | |
+|:--|:--|
+| [Quick start](#-quick-start) | Define a YAML graph and execute it |
+| [Results](#-read-the-results) | Success, failure, and skipped outcomes |
+| [Execution controls](#-shape-the-run) | Select outputs, seed values, inspect the plan |
+| [Scopes](#-keep-operations-in-their-lane) | Register operations for named DAGs |
+| [Configuration](#-choose-your-config-style) | YAML, JSON, or Python `Node` objects |
+
+## 🚀 Quick start
+
+Install with uv:
 
 ```bash
 uv add lightweight-dag
 ```
 
-To install the development and test dependencies when working from a clone of
-the repository:
+First, save this graph as [`examples/numbers.yaml`](examples/numbers.yaml):
 
-```bash
-uv sync --group dev
+```yaml
+nodes:
+  - node_id: numbers
+    operation: load_numbers
+  - node_id: answer
+    operation: total
+    inputs: [numbers]
 ```
 
-The public API is available from the package root:
-
-```python
-from lightweight_dag import Dag, DagExecutionResult, DagSuite, Node, dag_node
-```
-
-## Registering operations
-
-Operations must be synchronous functions defined at module level. Passing one
-argument to the decorator registers a global operation:
-
-```python
-from lightweight_dag import dag_node
-
-
-@dag_node
-def normalize(values):
-    return [value.strip().lower() for value in values]
-```
-
-The operation ID defaults to the function name. To register an operation under
-a different ID, pass that ID to the decorator:
-
-```python
-@dag_node("normalize_customer_names")
-def clean_customer_names(names):
-    return [name.strip().title() for name in names]
-```
-
-Passing two arguments registers an operation for a specific DAG:
-
-```python
-from lightweight_dag import dag_node
-
-
-@dag_node("example_report", "filter_orders")
-def filter_monthly_orders(orders, minimum_total):
-    return [order for order in orders if order["total"] >= minimum_total]
-```
-
-To use the function name as the operation ID while registering it for one DAG,
-pass the DAG name by keyword:
-
-```python
-@dag_node(dag_name="customer_report")
-def load_customer_profile():
-    return {"name": "Ada", "plan": "Pro"}
-```
-
-This registers `load_customer_profile` only in the `customer_report` scope.
-A function can also have a different operation ID in a DAG scope by passing
-both names positionally, as in the `filter_orders` example above.
-
-A DAG without `name` looks up only global operations. A named DAG looks up only
-operations registered for that name; there is no fallback to the global scope.
-The same operation can therefore have different implementations in different
-scopes. Registering an operation twice in the same scope is an error.
-
-## Defining and running a suite
-
-A YAML suite maps DAG names to DAG definitions. A `Node.inputs` entry can refer
-to another node in the same DAG or to an external input supplied to `run`.
-Source nodes have no inputs and produce their values through their registered
-operation. The block-style suite example in [examples/dags.yaml](examples/dags.yaml)
-defines both `monthly_report` and `sales_audit`; the following code loads and
-executes both DAGs.
-
-Register each operation in the scope of the DAG that uses it. The same
-operation ID can have different implementations in different DAG scopes:
+Register the operations, read the file by path, and run the output:
 
 ```python
 from pathlib import Path
 
+from lightweight_dag import Dag, dag_node
+
+
+@dag_node
+def load_numbers():
+    return [2, 4, 6]
+
+
+@dag_node
+def total(numbers):
+    return sum(numbers)
+
+
+dag = Dag.from_yaml(Path("examples/numbers.yaml").read_text())
+result = dag.run(outputs=["answer"])
+
+assert result.status is True
+assert result.results["answer"].value == 12
+```
+
+> [!TIP]
+> A node input named `numbers` receives the value produced by the node whose ID
+> is `numbers`. Values are passed to operations as keyword arguments.
+
+## 🎛️ Read the results
+
+Every selected node gets one result object. Its concrete type tells you what
+happened; the run itself exposes a boolean `status`.
+
+| Outcome | Object | Read this |
+|:--|:--|:--|
+| ✅ Done | `SuccessfulNodeExecutionResult` | `.value` |
+| ❌ Failed | `ErrorNodeExecutionResult` | `.error` |
+| ⏭️ Not run | `SkippedNodeExecutionResult` | No value or exception |
+
+```python
+from lightweight_dag import SuccessfulNodeExecutionResult
+
+outcome = result.results["answer"]
+if isinstance(outcome, SuccessfulNodeExecutionResult):
+    print(outcome.value)
+```
+
+The result map is keyed by node ID. A successful function may return `None` and
+still produce a successful outcome. The base `NodeExecutionResult` also has a
+legacy `.result` boolean, true only for success; the concrete type is the
+recommended discriminator.
+
+## 🧩 Shape the run
+
+### Only run the path you need
+
+`outputs` selects those nodes and their dependencies. Shared dependencies run
+once; unrelated branches stay untouched. Omit `outputs` to run every node, or
+pass `outputs=[]` to run none.
+
+```mermaid
+flowchart LR
+    A[a] --> B[b]
+    B --> C[c]
+    B --> D[d]
+    classDef selected fill:#BBF7D0,stroke:#16A34A,color:#14532D,stroke-width:2px
+    classDef idle fill:#F3F4F6,stroke:#9CA3AF,color:#4B5563
+    class A,B,D selected
+    class C idle
+```
+
+Requesting `outputs=["d"]` runs `a`, `b`, and `d`; `c` is skipped because it
+isn't on the selected path.
+
+### Bring values in
+
+`run()` keyword arguments can provide external inputs declared in `Node.inputs`
+or seed a node by ID. Seeding an intermediate node skips it and its ancestors;
+downstream nodes still run with the supplied value.
+
+```python
+# For a graph with eligible_orders -> summary:
+report = dag.run(
+    eligible_orders=[{"total": 60}, {"total": 80}],
+    outputs=["summary"],
+)
+```
+
+External input names are not node IDs. For example, a node can declare
+`inputs=["subtotal", "rate"]`; then call `dag.run(subtotal=100, rate=0.2, ...)`.
+`Node.params` supplies fixed string or numeric keyword arguments from the DAG
+configuration.
+
+### Preview before running
+
+`explain()` returns a `DagExecutionPlan` without calling any operation:
+
+```python
+plan = dag.explain(outputs=["answer"], numbers=[3, 5])
+
+plan.execution_order          # selected nodes in execution order
+plan.required_external_inputs # inputs needed by this path
+plan.missing_external_inputs  # required inputs not supplied
+plan.seeded_nodes             # nodes supplied directly
+```
+
+Graph inspection is available too:
+
+```python
+dag.dependencies("answer")    # direct inputs, including external names
+dag.descendants("numbers")     # transitive dependents
+dag.topological_order()         # full deterministic order
+```
+
+These methods return tuples and raise `ValueError` for unknown node IDs.
+
+### Stream outcomes
+
+Pass `listeners` to receive each result as its node finishes. Listeners receive
+the same objects stored in `DagExecutionResult.results`, in execution order:
+
+```python
+def log_result(outcome):
+    print(outcome.node_id, type(outcome).__name__)
+
+
+dag.run(outputs=["answer"], listeners=[log_result])
+```
+
+Listeners also receive seeded and skipped outcomes. Exceptions raised by a
+listener propagate to the caller.
+
+## 🛟 Failure behavior
+
+By default, a failed node is recorded and its dependents are skipped. Independent
+requested branches keep running, so useful partial results survive.
+
+```mermaid
+flowchart LR
+    A["source"] --> B["fails"]
+    B --> C["skipped"]
+    A --> D["independent: still runs"]
+    classDef bad fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D,stroke-width:2px
+    classDef skipped fill:#FEF3C7,stroke:#D97706,color:#78350F,stroke-width:2px
+    classDef good fill:#DCFCE7,stroke:#16A34A,color:#14532D,stroke-width:2px
+    class B bad
+    class C skipped
+    class D good
+```
+
+Set `fail_fast=True` to notify listeners of the failure, then immediately
+re-raise the original exception. No `DagExecutionResult` is returned in that
+mode.
+
+## 🔎 Keep operations in their lane
+
+Global operations are visible to unnamed DAGs. A named DAG sees only operations
+registered for exactly that name; there is no fallback to global operations.
+
+```python
+@dag_node(dag_name="sales_report")
+def load_orders():
+    return [{"total": 120}]
+```
+
+`load_orders` is available to `sales_report`, not to an unnamed DAG or a DAG
+with another name. To choose a separate operation ID, use
+`@dag_node("sales_report", "read_orders")`.
+
+`DagSuite` groups named DAGs. Register operations in the matching scope, then
+build a suite from a Python mapping:
+
+```python
 from lightweight_dag import DagSuite, dag_node
 
 
-@dag_node("monthly_report", "load_orders")
-def load_monthly_orders():
-    return [{"total": 75}, {"total": 35}]
+@dag_node("sales_report", "load_orders")
+def load_sales_orders():
+    return [{"total": 120}]
 
 
-@dag_node("monthly_report", "filter_orders")
-def filter_monthly_orders(orders, minimum_total):
-    return [order for order in orders if order["total"] >= minimum_total]
-
-
-@dag_node("monthly_report", "summarize_orders")
-def summarize_monthly_orders(eligible_orders):
-    return {"count": len(eligible_orders)}
-
-
-@dag_node("sales_audit", "load_orders")
-def load_audit_orders():
-    return [{"total": 75}, {"total": 35}]
-
-
-@dag_node(dag_name="sales_audit")
-def calculate_total(orders):
-    return sum(order["total"] for order in orders)
-
-
-@dag_node(dag_name="sales_audit")
-def classify_total(total, review_threshold):
-    return "review" if total >= review_threshold else "ok"
-
-
-suite = DagSuite.from_yaml(Path("examples/dags.yaml").read_text())
-monthly_report = suite["monthly_report"]
-sales_audit = suite["sales_audit"]
-
-report_result = monthly_report.run(outputs=["summary"])
-audit_result = sales_audit.run(outputs=["audit_result"])
-
-assert report_result.results["summary"] == {"count": 1}
-assert audit_result.results["audit_result"] == "review"
-```
-
-The operation registry is scoped: `monthly_report` cannot use operations
-registered only for `sales_audit`, and named DAGs do not fall back to global
-operations. The YAML key supplies the DAG name; an explicit `name` field is
-optional, but if present it must match the key. `suite[name]` raises `KeyError`
-for an unknown name.
-
-`DagSuite.from_dict(...)` accepts the same name-to-definition mapping. For a
-single DAG, use `Dag.from_yaml(...)` or `Dag.from_dict(...)`. You can also
-build one directly from `Node` instances:
-
-```python
-from lightweight_dag import Dag, Node, dag_node
-
-
-@dag_node
-def make_number():
-    return 21
-
-
-@dag_node
-def double_number(number):
-    return number * 2
-
-
-dag = Dag(
-    nodes=[
-        Node(node_id="number", operation="make_number"),
-        Node(
-            node_id="answer",
-            operation="double_number",
-            inputs=["number"],
-        ),
-    ]
-)
-result = dag.run(outputs=["answer"])
-assert result.results["answer"] == 42
-```
-
-To load a single DAG from YAML, register its global operations and pass the
-YAML document to `Dag.from_yaml(...)`:
-
-```python
-from lightweight_dag import Dag, dag_node
-
-
-@dag_node
-def yaml_source(): return 21
-
-
-@dag_node
-def yaml_double(number): return number * 2
-
-
-dag = Dag.from_yaml("""{nodes: [
-{node_id: number, operation: yaml_source},
-{node_id: answer, operation: yaml_double, inputs: [number]}
-]}""")
-assert dag.run(outputs=["answer"]).results["answer"] == 42
-```
-
-## Inputs and execution
-
-Call `Dag.run()` with no arguments to execute every node. To execute only
-selected outputs and their dependencies, pass their IDs in `outputs`. Each
-operation receives its predecessor node results and the YAML `params` as
-keyword arguments. Argument names correspond to predecessor IDs or parameter
-keys. Inputs that don't match a node ID are external inputs and are supplied
-as keyword arguments to `run`, for example `dag.run(elem2=value)`. Before
-execution, `run` checks each selected operation's signature for missing
-required arguments and unexpected argument names.
-
-```python
-all_results = monthly_report.run()
-assert set(all_results.results) == {"orders", "eligible_orders", "summary"}
-
-summary_result = monthly_report.run(outputs=["summary"])
-assert summary_result.results["summary"] == {"count": 1}
-
-# Reuse an already computed value instead of running its source node again.
-preloaded_orders = [{"total": 75}, {"total": 35}]
-summary_result = monthly_report.run(orders=preloaded_orders, outputs=["summary"])
-
-if summary_result.status:
-    print(summary_result.results["summary"])
-```
-
-Keyword arguments to `run` can provide either external input values or
-precomputed values keyed by node ID. A precomputed node's operation and its
-ancestors are skipped; downstream nodes receive the supplied value as usual.
-External inputs are checked when `run` executes a path that requires them;
-missing values or undeclared input names raise `ValueError`.
-
-Use `explain()` to inspect a planned execution without running operations. Its
-Pydantic result exposes immutable lists for the execution order, required and
-missing external inputs, and precomputed (`seeded`) nodes:
-
-```python
-plan = dag.explain(outputs=["combined"])
-assert plan.execution_order == ["elem1", "combined"]
-assert plan.required_external_inputs == ["elem2"]
-assert plan.missing_external_inputs == ["elem2"]
-assert plan.seeded_nodes == []
-```
-
-Pass values to `explain()` just as you would to `run()` to see which external
-inputs remain missing and which nodes will be seeded.
-
-To observe nodes as they finish, pass callbacks with `listeners`. Each callback
-receives a `NodeExecutionResult` containing the `node_id`, a boolean
-`result` indicating success, and the node's `value` (`None` on failure). The
-optional `dag_name` identifies the DAG scope. Events are emitted in execution
-order, including for precomputed and skipped nodes. Exceptions raised by
-listeners propagate to the caller.
-
-```python
-from lightweight_dag import NodeExecutionResult
-
-
-def report_node(event: NodeExecutionResult) -> None:
-    outcome = "ok" if event.result else "failed"
-    dag_name = event.dag_name or "dag"
-    print(f"[{dag_name}] {event.node_id}: {outcome} -> {event.value!r}")
-
-
-summary_result = monthly_report.run(
-    outputs=["summary"],
-    listeners=[report_node],
-)
-```
-
-An unknown output raises `ValueError`. The result contains `status` and
-`results`; `results` contains the computed node values. With `outputs=[]`, no
-nodes are executed and `results` is empty. Omitting `outputs` is different:
-all nodes are selected, including independent branches.
-
-Shared predecessors are computed only once, and nodes outside the requested
-paths are not executed. In this graph, requesting only `d` computes `a`, `b`,
-and `d`; `c` is not executed:
-
-```mermaid
-flowchart TD
-        a --> b --> c
-        b --> d
-```
-
-```python
-from lightweight_dag import Dag, Node, dag_node
-
-
-@dag_node
-def get_a():
-    return "a"
-
-
-@dag_node
-def make_b(a):
-    return f"{a}->b"
-
-
-@dag_node
-def make_c(b):
-    return f"{b}->c"
-
-
-@dag_node
-def make_d(b):
-    return f"{b}->d"
-
-
-dag = Dag(
-    nodes=[
-        Node(node_id="a", operation="get_a"),
-        Node(node_id="b", operation="make_b", inputs=["a"]),
-        Node(node_id="c", operation="make_c", inputs=["b"]),
-        Node(node_id="d", operation="make_d", inputs=["b"]),
-    ]
-)
-result = dag.run(outputs=["d"])
-
-assert result.results == {
-        "a": "a",
-        "b": "a->b",
-        "d": "a->b->d",
-}
-assert "c" not in result.results
-```
-
-If an operation raises an exception, its result is the exception object and
-the results of its dependent nodes become `None`; `status` becomes `False`.
-Requested, independent branches continue to execute. This example demonstrates
-the failure result:
-
-```python
-from lightweight_dag import Dag, dag_node
-
-
-@dag_node
-def always_fail(): raise RuntimeError("operation failed")
-
-
-@dag_node
-def consume_result(value): return value
-
-
-failure_dag = Dag.from_dict(
+suite = DagSuite.from_dict(
     {
-        "nodes": [
-            {"node_id": "failed", "operation": "always_fail"},
-            {
-                "node_id": "dependent",
-                "operation": "consume_result",
-                "inputs": ["failed"],
-            },
-        ]
+        "sales_report": {
+            "nodes": [{"node_id": "orders", "operation": "load_orders"}]
+        }
     }
 )
-failure_result = failure_dag.run(outputs=["dependent"])
-assert failure_result.status is False
-assert isinstance(failure_result.results["failed"], RuntimeError)
-assert failure_result.results["dependent"] is None
+assert suite["sales_report"].run().results["orders"].value == [{"total": 120}]
 ```
 
-## Validation and security
+To load [`examples/dags.yaml`](examples/dags.yaml), register every configured
+operation in its matching scope, then pass `Path("examples/dags.yaml").read_text()`
+to `DagSuite.from_yaml()`. The YAML mapping key supplies the DAG name and must
+match any explicit `name` in its definition.
 
-Loading validates that node IDs are unique, internal dependencies refer to
-existing nodes, the graph is acyclic, and operations are registered in the
-correct scope. Required external inputs are checked at execution. It also
-rejects unknown fields and duplicate YAML keys. When a node input and a
-parameter have the same name, the computed input takes precedence. `params`
-values must be strings or numbers. `Node`, `Dag`, and
-`DagSuite` definitions, including their collections, are immutable after
-validation; `DagExecutionResult` contains the results of an individual
-execution.
+## 🗂️ Choose your config style
 
-Topological sorting uses Kahn's algorithm with $O(V+E)$ complexity, where $V$
-is the number of nodes and $E$ is the number of dependencies. Execution sorts
-only the subgraph needed for the requested outputs.
+### YAML file
 
-YAML definitions can invoke Python functions registered by the application.
-Only load and execute configurations from trusted sources.
+`Dag.from_yaml()` accepts YAML text. Read a file with `Path.read_text()` as in
+the quick start. `to_dict()` returns a plain configuration dictionary and
+omits fields that were not set, so the configuration round-trips without
+injecting defaults:
 
-## Testing and building
+```python
+from pathlib import Path
+
+dag = Dag.from_yaml(Path("examples/numbers.yaml").read_text())
+assert dag.to_dict() == {
+    "nodes": [
+        {"node_id": "numbers", "operation": "load_numbers"},
+        {"node_id": "answer", "operation": "total", "inputs": ["numbers"]},
+    ]
+}
+```
+
+### JSON text
+
+Pass JSON text directly to Pydantic's `Dag.model_validate_json()`:
+
+```python
+json_config = '{"nodes": [{"node_id": "numbers", "operation": "load_numbers"}]}'
+dag = Dag.model_validate_json(json_config)
+```
+
+If JSON is already parsed into a Python dictionary, use `Dag.from_dict(data)`.
+
+### Python objects
+
+For a graph assembled in code, pass `Node` instances directly to `Dag`:
+
+```python
+from lightweight_dag import Dag, Node
+
+dag = Dag(
+    nodes=[
+        Node(node_id="numbers", operation="load_numbers"),
+        Node(node_id="answer", operation="total", inputs=["numbers"]),
+    ]
+)
+```
+
+YAML comments and formatting aren't retained by `to_dict()`. Configuration
+serialization does not include registered functions or runtime values.
+
+## 🧪 Extra checks
+
+Opt into static producer/consumer annotation compatibility checks before any
+selected operation runs:
+
+```python
+result = dag.run(outputs=["answer"], validate_types=True)
+```
+
+Common classes, unions, and parameterized generics are checked. Missing
+annotations, `Any`, and unfamiliar typing forms are handled conservatively.
+This is not runtime type enforcement.
+
+Configuration is validated before execution:
+
+| Problem | What happens |
+|:--|:--|
+| Duplicate node IDs or cycles | DAG construction fails |
+| Unknown operation in this scope | DAG construction fails |
+| Missing external input | `ValueError` |
+| Undeclared `run()` keyword | `ValueError` |
+| Invalid operation arguments | Rejected before selected operations run |
+| Duplicate YAML mapping key | YAML loading fails |
+
+Only load and run YAML from trusted sources: a config chooses which registered
+Python functions execute. When a node input and a parameter have the same name,
+the computed input takes precedence.
+
+## 📦 Scope
+
+`lightweight-dag` is a synchronous, in-process DAG runner. It does not include
+parallel scheduling, retries, timeouts, persistent caching, distributed
+execution, visualization, or DAG composition. Composition needs explicit rules
+for external input/output mapping and node-ID conflicts, so it stays out of the
+API for now.
+
+For development:
 
 ```bash
+uv sync --group dev
 uv run pytest
 uv build
 ```
-
-`pytest` automatically measures line and branch coverage for the entire
-package. To run an individual test without coverage, use
-`uv run pytest --no-cov ...`.

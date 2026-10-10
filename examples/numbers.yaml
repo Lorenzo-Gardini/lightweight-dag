@@ -1,0 +1,6 @@
+nodes:
+  - node_id: numbers
+    operation: load_numbers
+  - node_id: answer
+    operation: total
+    inputs: [numbers]
