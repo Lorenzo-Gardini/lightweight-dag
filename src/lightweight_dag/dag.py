@@ -3,8 +3,9 @@
 from collections import deque
 from collections.abc import Callable
 from functools import cached_property
-from inspect import signature
-from typing import Any
+from inspect import Signature, signature
+from types import UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -31,6 +32,66 @@ class _FrozenDict(dict):
 
     __delitem__ = __ior__ = __setitem__ = _reject_mutation
     clear = pop = popitem = setdefault = update = _reject_mutation
+
+
+def _function_annotations(function: Callable[..., Any]) -> dict[str, Any]:
+    try:
+        return get_type_hints(function)
+    except (NameError, TypeError):
+        return dict(getattr(function, "__annotations__", {}))
+
+
+def _type_is_compatible(produced: Any, expected: Any) -> bool:
+    """Conservatively compare common Python annotations without checking values."""
+    if produced in (Any, Signature.empty) or expected in (Any, Signature.empty):
+        return True
+    if produced is None:
+        produced = type(None)
+    if expected is None:
+        expected = type(None)
+
+    produced_origin = get_origin(produced)
+    expected_origin = get_origin(expected)
+    union_types = (Union, UnionType)
+    produced_args = get_args(produced)
+    expected_args = get_args(expected)
+
+    if produced_origin in union_types:
+        produced_options = produced_args
+    else:
+        produced_options = (produced,)
+    if expected_origin in union_types:
+        expected_options = expected_args
+    else:
+        expected_options = (expected,)
+
+    if len(produced_options) > 1 or len(expected_options) > 1:
+        return all(
+            any(_type_is_compatible(option, accepted) for accepted in expected_options)
+            for option in produced_options
+        )
+
+    actual = produced_options[0]
+    wanted = expected_options[0]
+    actual_origin = get_origin(actual) or actual
+    wanted_origin = get_origin(wanted) or wanted
+    if not isinstance(actual_origin, type) or not isinstance(wanted_origin, type):
+        return True
+    try:
+        if not issubclass(actual_origin, wanted_origin):
+            return False
+    except TypeError:
+        return True
+
+    actual_args = get_args(actual)
+    wanted_args = get_args(wanted)
+    if not actual_args or not wanted_args or len(actual_args) != len(wanted_args):
+        return True
+    return all(
+        _type_is_compatible(actual_arg, wanted_arg)
+        and _type_is_compatible(wanted_arg, actual_arg)
+        for actual_arg, wanted_arg in zip(actual_args, wanted_args)
+    )
 
 
 def _load_yaml(yaml_str: str) -> Any:
@@ -94,13 +155,47 @@ class Node(BaseModel):
         return _FrozenDict(value)
 
 
+class NodeExecutionResult(BaseModel):
+    """Common identity for one node's execution outcome."""
+
+    node_id: str
+    dag_name: str | None = None
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+    )
+
+    @property
+    def result(self) -> bool:
+        """Legacy success flag, derived from the concrete outcome type."""
+        return isinstance(self, SuccessfulNodeExecutionResult)
+
+
+class SuccessfulNodeExecutionResult(NodeExecutionResult):
+    """Successful node outcome containing its produced value."""
+
+    value: Any
+
+
+class ErrorNodeExecutionResult(NodeExecutionResult):
+    """Failed node outcome containing the original exception."""
+
+    error: Exception
+
+
+class SkippedNodeExecutionResult(NodeExecutionResult):
+    """Skipped node outcome with no produced value or exception."""
+
+
 class DagExecutionResult(BaseModel):
-    """Execution status and values produced or retained during a DAG run."""
+    """Run status and per-node outcomes."""
 
     status: bool
-    results: dict[str, Any] = Field(
+    results: dict[str, NodeExecutionResult] = Field(
         default_factory=_FrozenDict,
-        description="Dictionary of results for this DAG execution",
+        description="Execution outcome for each selected node",
     )
 
     model_config = ConfigDict(
@@ -111,23 +206,23 @@ class DagExecutionResult(BaseModel):
 
     @field_validator("results")
     @classmethod
-    def freeze_results(cls, value: dict[str, Any]) -> dict[str, Any]:
+    def freeze_results(
+        cls, value: dict[str, NodeExecutionResult]
+    ) -> dict[str, NodeExecutionResult]:
         return _FrozenDict(value)
 
-
-class NodeExecutionResult(BaseModel):
-    """Outcome emitted when one node becomes available during execution."""
-
-    node_id: str
-    dag_name: str | None = None
-    result: bool
-    value: Any
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        arbitrary_types_allowed=True,
-    )
+    @model_validator(mode="after")
+    def check_result_node_ids(self) -> "DagExecutionResult":
+        mismatched_ids = [
+            node_id
+            for node_id, outcome in self.results.items()
+            if node_id != outcome.node_id
+        ]
+        if mismatched_ids:
+            raise ValueError(
+                f"Result keys must match outcome node IDs: {sorted(mismatched_ids)}"
+            )
+        return self
 
 
 class DagExecutionPlan(BaseModel):
@@ -255,6 +350,10 @@ class Dag(BaseModel):
         """Validate one DAG from a dictionary."""
         return cls.model_validate(data)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return this DAG's configuration as a plain dictionary."""
+        return self.model_dump(mode="python", exclude_unset=True)
+
     @classmethod
     def topological_sort(cls, nodes: list[Node]) -> list[str]:
         """Return node IDs in dependency order using Kahn's linear-time algorithm."""
@@ -279,7 +378,9 @@ class Dag(BaseModel):
         for node in nodes:
             dependencies = set(node.inputs) & known_ids
             in_degree[node.node_id] = len(dependencies)
-            for dependency in dependencies:
+            for dependency in dict.fromkeys(node.inputs):
+                if dependency not in dependencies:
+                    continue
                 dependents[dependency].append(node.node_id)
 
         ready = deque(node.node_id for node in nodes if in_degree[node.node_id] == 0)
@@ -296,6 +397,49 @@ class Dag(BaseModel):
             raise ValueError("DAG contains a cycle")
 
         return result
+
+    def dependencies(self, node_id: str) -> tuple[str, ...]:
+        """Return the declared direct inputs for a node, including external ones."""
+        try:
+            return tuple(self._nodes_by_id[node_id].inputs)
+        except KeyError as error:
+            raise ValueError(f"Unknown node ID: {node_id!r}") from error
+
+    def topological_order(self) -> tuple[str, ...]:
+        """Return all node IDs in deterministic dependency order."""
+        node_ids = self._nodes_by_id.keys()
+        internal_nodes = [
+            node.model_copy(
+                update={
+                    "inputs": [
+                        input_id for input_id in node.inputs if input_id in node_ids
+                    ]
+                }
+            )
+            for node in self.nodes
+        ]
+        return tuple(self.topological_sort(internal_nodes))
+
+    def descendants(self, node_id: str) -> tuple[str, ...]:
+        """Return all transitive dependents in topological order."""
+        if node_id not in self._nodes_by_id:
+            raise ValueError(f"Unknown node ID: {node_id!r}")
+        dependents = {candidate: [] for candidate in self._nodes_by_id}
+        for node in self.nodes:
+            for dependency in dict.fromkeys(node.inputs):
+                if dependency in dependents:
+                    dependents[dependency].append(node.node_id)
+
+        found = set()
+        pending = list(dependents[node_id])
+        while pending:
+            dependent = pending.pop()
+            if dependent not in found:
+                found.add(dependent)
+                pending.extend(dependents[dependent])
+        return tuple(
+            candidate for candidate in self.topological_order() if candidate in found
+        )
 
     def explain(
         self,
@@ -369,18 +513,22 @@ class Dag(BaseModel):
         self,
         outputs: list[str] | None = None,
         listeners: list[Callable[[NodeExecutionResult], None]] | None = None,
+        *,
+        fail_fast: bool = False,
+        validate_types: bool = False,
         **inputs: Any,
     ) -> DagExecutionResult:
         """Execute requested outputs and their transitive dependencies.
 
         Each operation receives predecessor results and node params as keyword
         arguments. Failed nodes are skipped along with their descendants, while
-        independent requested branches continue to run. Values passed as
-        keyword arguments seed matching nodes and skip their operations. If
-        listeners are provided, each receives a NodeExecutionResult after a
-        required node succeeds, fails, is skipped, or uses a supplied value.
-        Listener exceptions propagate to the caller. If outputs is omitted,
-        every node is selected; an empty list selects no nodes.
+        independent requested branches continue to run unless ``fail_fast`` is
+        true, in which case the original exception is re-raised. Set
+        ``validate_types`` to check compatible declared annotations before
+        invoking operations; this is a conservative static check, not runtime
+        type enforcement. Values passed as keyword arguments seed matching
+        nodes and skip their operations. Listener exceptions propagate. If
+        outputs is omitted, every node is selected; an empty list selects none.
         """
         plan = self.explain(outputs=outputs, **inputs)
         if plan.missing_external_inputs:
@@ -389,9 +537,7 @@ class Dag(BaseModel):
             )
         nodes_by_id = self._nodes_by_id
         sorted_node_ids = plan.execution_order
-        context = {}
-        is_run_successful = True
-        failed_node_ids = set()
+        outcomes = {}
         registered_functions = (
             get_registered_nodes()
             if self.name is None
@@ -401,46 +547,78 @@ class Dag(BaseModel):
             if node_id in inputs:
                 continue
             node = nodes_by_id[node_id]
+            function = registered_functions[node.operation]
             argument_names = dict.fromkeys(node.params)
             argument_names.update(dict.fromkeys(node.inputs))
             try:
-                signature(registered_functions[node.operation]).bind(**argument_names)
+                operation_signature = signature(function)
+                operation_signature.bind(**argument_names)
             except TypeError as error:
                 raise ValueError(
                     f"Invalid arguments for node '{node_id}' "
                     f"(operation '{node.operation}'): {error}"
                 ) from error
 
-        def notify_listeners(node_id: str, result: bool, value: Any) -> None:
-            if listeners is None:
-                return
-            event = NodeExecutionResult(
-                node_id=node_id,
-                dag_name=self.name,
-                result=result,
-                value=value,
-            )
-            for listener in listeners:
-                listener(event)
+            if validate_types:
+                annotations = _function_annotations(function)
+                for input_id in node.inputs:
+                    expected_type = annotations.get(input_id, Signature.empty)
+                    if expected_type is Signature.empty:
+                        continue
+                    if input_id in nodes_by_id:
+                        if input_id in inputs:
+                            produced_type = type(inputs[input_id])
+                        else:
+                            producer = registered_functions[
+                                nodes_by_id[input_id].operation
+                            ]
+                            produced_type = _function_annotations(producer).get(
+                                "return", Signature.empty
+                            )
+                    elif input_id in inputs:
+                        produced_type = type(inputs[input_id])
+                    else:
+                        continue
+                    if not _type_is_compatible(produced_type, expected_type):
+                        raise ValueError(
+                            f"Incompatible type for input '{input_id}' of node "
+                            f"'{node_id}': producer declares {produced_type!r}, "
+                            f"consumer expects {expected_type!r}"
+                        )
+
+        def notify_listeners(outcome: NodeExecutionResult) -> NodeExecutionResult:
+            if listeners is not None:
+                for listener in listeners:
+                    listener(outcome)
+            return outcome
 
         for node_id in sorted_node_ids:
             node = nodes_by_id[node_id]
             if node_id in inputs:
-                context[node_id] = inputs[node_id]
-                notify_listeners(node_id, True, inputs[node_id])
+                outcomes[node_id] = notify_listeners(
+                    SuccessfulNodeExecutionResult(
+                        node_id=node_id, dag_name=self.name, value=inputs[node_id]
+                    )
+                )
                 continue
-            if any(input_id in failed_node_ids for input_id in node.inputs):
-                context[node_id] = None
-                failed_node_ids.add(node_id)
-                is_run_successful = False
-                notify_listeners(node_id, False, None)
+            if any(
+                input_id in outcomes
+                and isinstance(
+                    outcomes[input_id],
+                    (ErrorNodeExecutionResult, SkippedNodeExecutionResult),
+                )
+                for input_id in node.inputs
+            ):
+                outcomes[node_id] = notify_listeners(
+                    SkippedNodeExecutionResult(node_id=node_id, dag_name=self.name)
+                )
                 continue
 
             node_inputs = dict(node.params)
             node_inputs.update(
                 {
                     input_id: (
-                        context[input_id]
+                        outcomes[input_id].value
                         if input_id in nodes_by_id
                         else inputs[input_id]
                     )
@@ -450,12 +628,21 @@ class Dag(BaseModel):
             try:
                 result = registered_functions[node.operation](**node_inputs)
             except Exception as error:
-                context[node_id] = error
-                failed_node_ids.add(node_id)
-                is_run_successful = False
-                notify_listeners(node_id, False, None)
+                outcomes[node_id] = notify_listeners(
+                    ErrorNodeExecutionResult(
+                        node_id=node_id, dag_name=self.name, error=error
+                    )
+                )
+                if fail_fast:
+                    raise
             else:
-                context[node_id] = result
-                notify_listeners(node_id, True, result)
+                outcomes[node_id] = notify_listeners(
+                    SuccessfulNodeExecutionResult(
+                        node_id=node_id, dag_name=self.name, value=result
+                    )
+                )
 
-        return DagExecutionResult(status=is_run_successful, results=context)
+        return DagExecutionResult(
+            status=all(outcome.result for outcome in outcomes.values()),
+            results=outcomes,
+        )
